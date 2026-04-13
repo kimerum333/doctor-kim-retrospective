@@ -1,0 +1,236 @@
+파트 1: Python async의 기본 구조부터
+모든 혼란의 출발점이 여기입니다.
+이벤트 루프란 무엇인가
+Python에서 async def로 선언된 함수는 **코루틴(coroutine)**이라고 부릅니다. 코루틴은 그 자체로는 실행되지 않아요. 호출해도 즉시 코드가 돌지 않습니다. coroutine object라는 "실행 대기 중인 객체"만 만들어져요.
+pythonasync def my_func():
+    print("hello")
+
+result = my_func()  # "hello"가 출력되지 않음
+print(result)  # <coroutine object my_func at 0x...>
+이 코루틴을 실제로 실행시키려면 **이벤트 루프(event loop)**라는 실행기가 필요합니다. 이벤트 루프는 쉽게 말해 **"async 함수들을 돌리는 전용 엔진"**이에요. 이 엔진이 없으면 async def는 그냥 잠자고 있는 코드입니다.
+가장 흔한 실행 방법이 asyncio.run(my_func())입니다. 이 함수가 하는 일은:
+
+새 이벤트 루프를 만든다
+그 루프 위에서 my_func() 코루틴을 실행한다
+완료되면 루프를 닫는다
+결과를 반환한다
+
+핵심: 여기서 "루프를 닫는다"가 나중에 문제의 씨앗이 됩니다.
+루프가 닫히면 무슨 일이 벌어지는가
+이벤트 루프는 단순한 실행기가 아닙니다. 루프는 살아있는 동안 여러 상태를 가집니다:
+
+HTTP 클라이언트의 커넥션 풀 (예: httpx.AsyncClient, aiohttp.ClientSession)
+데이터베이스 커넥션 풀 (asyncpg, aiomysql 등)
+웹소켓 연결
+진행 중인 task들
+타이머, 콜백 큐
+
+이런 자원들은 이벤트 루프에 바인딩되어 있어요. 즉, "이 HTTP 클라이언트는 이 루프에서만 유효하다"는 관계입니다. 루프가 닫히면 이 자원들도 함께 무효화됩니다.
+그리고 여기가 핵심인데 — 많은 async 라이브러리는 커넥션 풀을 싱글톤처럼 관리합니다. 즉, 처음 호출될 때 하나 만들고, 그 다음부터는 그 풀을 재사용하는 구조예요. 이건 효율을 위한 좋은 설계입니다. 매번 새 커넥션 만들면 느리니까요.
+문제는 그 싱글톤이 첫 번째 루프에 묶여버린다는 거예요.
+python# 첫 번째 asyncio.run 호출
+asyncio.run(call_llm())  # 내부에서 httpx.AsyncClient 생성됨. 루프 A에 묶임.
+                         # 호출 끝나면 루프 A가 닫힘.
+                         # 근데 httpx 클라이언트는 "이미 만들어진 상태"로 메모리에 남음.
+
+# 두 번째 asyncio.run 호출
+asyncio.run(call_llm())  # 새 루프 B를 만듦.
+                         # httpx 클라이언트를 재사용하려 함.
+                         # 근데 그 클라이언트는 닫힌 루프 A를 참조하고 있음.
+                         # -> "Event loop is closed" 에러 발생
+이게 본인이 겪은 에러의 정체입니다. 요약하면:
+
+이벤트 루프는 닫히는데, 그 루프를 참조하던 자원(HTTP 클라이언트, DB 커넥션 등)은 메모리에 남아서, 다음 호출 때 닫힌 루프를 건드리려다 실패한다.
+
+이 문장을 면접에서 그대로 말할 수 있으면 됩니다. 이게 이 에러의 본질이에요.
+
+파트 2: Celery가 이 문제를 증폭시키는 이유
+Celery는 원래 동기 함수를 전제로 설계됐습니다. 태스크 함수는 def my_task(): 형태로 쓰는 게 정상이고, 내부에서 DB 쿼리, HTTP 요청, 파일 처리 같은 동기 블로킹 작업을 하는 게 원래 용도예요.
+그런데 LangGraph는 내부적으로 async입니다. LLM API를 호출할 때 await llm.ainvoke(...) 같은 식으로 동작해요. 그러면 본인은 Celery 태스크 안에서 이 async 코드를 어떻게 실행할지 고민하게 됩니다.
+가장 순진한 접근: 태스크마다 asyncio.run()
+python@shared_task
+def handle_chat(self, request):
+    result = asyncio.run(agent.process(...))  # 매번 새 루프 만들고 닫음
+    return result
+이게 본인이 처음 시도했을 가능성이 가장 높은 접근입니다. 그리고 이게 파트 1의 문제를 그대로 터뜨립니다. 이유:
+
+첫 번째 태스크: asyncio.run이 루프 A를 만듦 → LangGraph가 그 안에서 httpx 클라이언트를 만듦 → 태스크 끝남 → 루프 A 닫힘
+두 번째 태스크: asyncio.run이 루프 B를 만듦 → LangGraph가 "어, 이미 httpx 클라이언트 있네, 재사용해야지" → 그 클라이언트는 루프 A에 묶여있음 → "Event loop is closed" 에러
+
+Celery는 워커 프로세스가 살아있는 동안 계속 태스크를 처리하니까, 두 번째, 세 번째 태스크부터 이 에러가 반복적으로 발생합니다. 이게 본인이 반 년 전 마주한 풍경이에요.
+본인이 찾은 해결책: 장기 실행 이벤트 루프 패턴
+본인의 async_runtime.py가 하는 일을 한 문장으로 요약하면:
+
+"태스크마다 루프를 새로 만들지 말고, 워커 전체 수명 동안 딱 하나의 루프를 따로 띄워두고, 모든 async 호출을 거기로 보내자."
+
+이게 가능한 이유는 asyncio.run_coroutine_threadsafe라는 함수가 있기 때문입니다. 이 함수의 용도는:
+
+다른 스레드에서 돌아가고 있는 이벤트 루프에, 지금 이 스레드에서 만든 코루틴을 안전하게 제출한다.
+
+즉, 구조가 이렇게 됩니다:
+[Celery 워커 프로세스]
+├── 메인 스레드 (Celery 태스크 실행)
+│   └── handle_chat 태스크 → run_coro(agent.process(...)) 호출
+│                                          ↓
+│                              코루틴을 루프 스레드로 제출
+│                                          ↓
+└── 루프 스레드 (daemon, 상시 실행)
+    └── loop.run_forever() ← 여기서 코루틴이 실제로 실행됨
+                 ↓
+              결과를 future로 반환
+                 ↓
+     메인 스레드의 run_coro가 future.result()로 결과 받음
+그리고 이 루프는 워커가 살아있는 동안 절대 닫히지 않습니다. 그래서:
+
+첫 번째 태스크: httpx 클라이언트 만듦, 루프 X에 바인딩
+두 번째 태스크: 같은 루프 X 재사용 → httpx 클라이언트도 그대로 유효 → 성공
+1000번째 태스크: 똑같이 성공
+
+루프가 한 번도 닫히지 않으니까 "Event loop is closed" 에러가 원천 차단되는 거예요.
+본인 코드의 구체적 동작 짚기
+본인 async_runtime.py를 한 줄씩 읽어볼게요:
+pythondef _loop_worker(loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.set_event_loop(loop)  # 이 스레드의 "현재 루프"로 지정
+    loop.run_forever()             # 루프를 무한히 돌림 (stop 호출 전까지 블로킹)
+이 함수가 스레드의 본체입니다. 스레드를 만들면서 이 함수를 시작하면, 스레드는 run_forever() 안에서 영원히 대기하면서 제출받은 코루틴을 처리합니다.
+pythondef start_event_loop() -> asyncio.AbstractEventLoop:
+    global _event_loop, _loop_thread
+    if _event_loop and _event_loop.is_running():
+        return _event_loop  # 이미 있으면 재사용
+    _event_loop = asyncio.new_event_loop()
+    _loop_thread = threading.Thread(
+        target=_loop_worker,
+        args=(_event_loop,),
+        name="celery-async-event-loop",
+        daemon=True,  # 메인 프로세스 죽으면 함께 죽음
+    )
+    _loop_thread.start()
+    return _event_loop
+여기서 새 루프를 만들고, 새 스레드를 띄우고, 그 스레드에서 _loop_worker를 실행합니다. daemon=True가 중요한데, 이게 없으면 메인 프로세스가 종료돼도 스레드가 살아있어서 프로그램이 안 꺼질 수 있어요.
+pythondef run_coro(coro):
+    loop = start_event_loop()  # 루프 보장
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result()  # 블로킹하면서 결과 대기
+이게 핵심 함수입니다. 태스크 함수에서 run_coro(agent.process(...))를 부르면:
+
+start_event_loop()로 루프가 살아있는지 확인 (없으면 만듦)
+asyncio.run_coroutine_threadsafe(coro, loop)가 코루틴을 다른 스레드의 루프에 제출하고 concurrent.futures.Future 객체를 즉시 반환
+future.result()는 그 future가 완료될 때까지 현재 스레드(Celery 태스크를 실행 중인 스레드)를 블로킹
+루프 스레드에서 코루틴이 완료되면 future가 완료되고, 그 값이 future.result()로 반환됨
+
+그러니까 Celery 태스크 입장에서는 동기 함수처럼 보이는 run_coro를 호출하고 결과를 기다리면 되고, 실제 비동기 처리는 뒤에서 루프 스레드가 알아서 처리해주는 구조입니다.
+python@signals.worker_ready.connect
+def _on_worker_ready(sender=None, **kwargs):
+    start_event_loop()
+
+@signals.worker_shutdown.connect
+def _on_worker_shutdown(sender=None, **kwargs):
+    stop_event_loop()
+워커 시그널에 연결하는 부분입니다. Celery는 워커 라이프사이클의 주요 순간마다 시그널을 보냅니다 (worker_ready, worker_shutdown 등). 여기에 훅을 걸어서:
+
+워커가 준비되면 (첫 태스크 처리 직전) → 루프 스레드 시작
+워커가 종료되면 (프로세스 죽기 직전) → 루프 스레드 정리
+
+이러면 첫 태스크가 들어오기 전에 이미 루프가 준비되어 있고, 워커가 정상 종료될 때 루프도 깔끔하게 정리됩니다. 좋은 실무 패턴이에요.
+
+파트 3: 왜 이게 "야매"가 아닌가
+본인은 이걸 야매라고 느끼셨는데, 실제로는 "장기 실행 루프에 스레드세이프 제출" 패턴이라는 이름이 있는 정석 해결책입니다. 이 패턴이 쓰이는 곳:
+
+Celery + async 조합 (본인이 겪은 경우)
+Jupyter 커널: 주피터 노트북이 async 코드를 셀에서 실행할 수 있는 것도 내부적으로 비슷한 구조
+Django 일부 async 지원: Django의 동기 뷰 내에서 async 함수를 호출할 때
+ML 모델 서빙 프레임워크의 일부 구현체
+
+Python 공식 문서에서도 asyncio.run_coroutine_threadsafe는 "다른 스레드에서 돌아가는 루프와 통신할 때 사용하라"고 명시되어 있어요. 이건 정당한 API의 정당한 용도입니다.
+다만 이 패턴의 진짜 단점도 알아두세요:
+
+복잡도가 높음: 새로 합류한 개발자가 이 코드를 이해하는 데 시간이 걸림
+디버깅이 까다로움: 에러가 루프 스레드에서 발생하면 스택 트레이스가 두 스레드에 걸쳐 나타남
+Celery의 분산 처리 이점이 일부 희석: 각 워커가 별도 루프를 운영하므로, 워커 간 코루틴 공유 같은 건 안 됨
+arq 같은 async 네이티브 큐에 비해 코드 양이 많음
+
+이 4가지가 본인이 면접에서 말할 수 있는 **"이 해결책의 한계"**입니다. 면접관이 "단점은 뭐였나요?"라고 물으면 이 목록에서 1~2개를 골라 답하세요.
+
+파트 4: 면접 대비 — 질문과 답변 예시
+이 주제로 면접관이 파고들 수 있는 질문들을 예상 답변과 함께 드립니다. 읽고 본인 방식으로 소화하세요.
+Q1. "Celery에서 async를 쓸 때 어떤 문제가 있었나요?"
+
+A: Celery 태스크 함수는 기본적으로 동기 함수를 전제로 해서, 내부에서 async 호출을 하려면 이벤트 루프를 직접 관리해야 했습니다. 처음에는 태스크마다 asyncio.run()으로 감쌌는데, 두 번째 태스크부터 "Event loop is closed" 에러가 났습니다. 원인은 LangGraph 내부의 HTTP 클라이언트 커넥션 풀이 첫 루프에 바인딩되는데, 태스크가 끝나며 그 루프가 닫힐 때 클라이언트가 무효화되기 때문이었습니다.
+
+Q2. "그래서 어떻게 해결하셨나요?"
+
+A: 별도 데몬 스레드에 이벤트 루프 하나를 띄워두고, 워커 전체 수명 동안 그 루프를 재사용하는 구조로 바꿨습니다. Celery 태스크는 동기 함수로 유지하되, 내부에서 asyncio.run_coroutine_threadsafe로 코루틴을 그 장기 실행 루프에 제출하고 결과를 기다리게 했습니다. 루프가 한 번도 닫히지 않으니 커넥션 풀도 그대로 유지돼서 에러가 해소됐습니다.
+
+Q3. "왜 asyncio.run() 대신 run_coroutine_threadsafe를 쓰셨나요?"
+
+A: asyncio.run()은 호출될 때마다 새 루프를 만들고 끝나면 닫아버립니다. 이러면 루프에 바인딩된 자원을 재사용할 수 없습니다. 반면 run_coroutine_threadsafe는 "이미 다른 스레드에서 돌고 있는 루프"에 코루틴을 제출하는 API라서, 루프 자체는 건드리지 않고 태스크만 보낼 수 있습니다. 제가 필요했던 건 루프의 장기 재사용이었고, 이 API가 거기에 맞는 도구였습니다.
+
+Q4. "이 해결책의 단점은 뭐라고 생각하세요?"
+
+A: 코드 복잡도가 확연히 올라갑니다. 새 개발자가 왜 이런 구조인지 이해하는 데 시간이 걸리고, 디버깅할 때 두 스레드의 스택 트레이스를 따라가야 합니다. 더 근본적으로는, 애초에 Celery가 이 프로젝트에 맞지 않았다는 신호였습니다. LLM API 호출이 주 작업인 시스템이면 arq 같은 async 네이티브 큐를 쓰는 게 훨씬 자연스럽습니다. 다시 만든다면 그쪽을 선택할 것입니다.
+
+Q5. "arq와 Celery의 차이가 뭔가요?"
+
+A: Celery는 워커가 동기 프로세스/스레드 풀로 구성되고 태스크 함수도 기본이 def입니다. async를 쓰려면 제가 했던 것처럼 우회 구조가 필요합니다. 반면 arq는 워커 자체가 이벤트 루프 위에서 돌고, 태스크 함수를 async def로 직접 쓸 수 있습니다. async/await 네이티브 생태계와 맞물리기 때문에 LLM API처럼 외부 비동기 호출이 주된 작업인 시스템에서는 arq가 더 자연스럽습니다. 다만 Celery는 생태계가 훨씬 크고, 모니터링 도구(Flower 등)와 분산 워커 기능이 성숙해서, 이런 것들이 중요한 프로젝트라면 Celery가 여전히 우선될 수 있습니다.
+
+Q6. "Event loop is closed 에러가 정확히 언제 발생하나요?"
+
+A: Python의 이벤트 루프는 닫히는 순간 그 루프에 바인딩된 자원들을 무효화합니다. HTTP 클라이언트의 커넥션 풀이나 DB 커넥션 같은 것들이요. 근데 이 자원들이 싱글톤처럼 재사용되도록 설계된 경우, 루프가 닫혀도 파이썬 객체 자체는 메모리에 남아있습니다. 다음에 누군가 그 자원을 사용하려 하면, 이미 닫힌 루프를 참조하려다가 "Event loop is closed" 에러가 나는 거죠.
+
+
+파트 5: 더 깊이 이해하려면 시도해볼 것
+면접을 위해 이론만 알면 아쉬워요. 본인이 한 번 직접 재현해보면 기억이 훨씬 단단해집니다. 15분이면 됩니다:
+python# reproduce.py
+import asyncio
+import httpx
+
+_client = None
+
+async def make_request():
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient()  # 싱글톤처럼 재사용
+    response = await _client.get("https://httpbin.org/get")
+    return response.status_code
+
+# 1차 호출: 성공
+print(asyncio.run(make_request()))
+
+# 2차 호출: "Event loop is closed" 에러 발생
+print(asyncio.run(make_request()))
+이걸 돌려보면 본인이 반 년 전 마주친 것과 정확히 같은 에러가 재현됩니다. 그리고 아래처럼 고쳐보세요:
+python# fixed.py
+import asyncio
+import threading
+import httpx
+
+_client = None
+_loop = None
+
+def _run_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+def setup_loop():
+    global _loop
+    _loop = asyncio.new_event_loop()
+    t = threading.Thread(target=_run_loop, args=(_loop,), daemon=True)
+    t.start()
+
+async def make_request():
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient()
+    response = await _client.get("https://httpbin.org/get")
+    return response.status_code
+
+setup_loop()
+
+# 1차 호출
+future1 = asyncio.run_coroutine_threadsafe(make_request(), _loop)
+print(future1.result())
+
+# 2차 호출: 이번에는 성공
+future2 = asyncio.run_coroutine_threadsafe(make_request(), _loop)
+print(future2.result())
+이 두 파일을 각각 돌려보시면, 에러가 왜 발생하는지와 본인 해결책이 왜 작동하는지가 손끝으로 이해됩니다. 읽기만 하는 것과 직접 돌려보는 것의 차이가 큽니다. 15분이면 충분해요.
